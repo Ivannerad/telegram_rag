@@ -45,8 +45,8 @@ poetry run python scripts/check_openai_connection.py --chat
 ```
 
 ## Telegram commands
-- `/ingest <text>`: enqueue document ingestion
-- send supported file attachment (PDF/TXT/MD/CSV/JSON/XML/code): extract text then enqueue ingestion
+- `/ingest <text>`: enqueue document ingestion (private chat only)
+- send supported file attachment (PDF/TXT/MD/CSV/JSON/XML/code): extract text then enqueue ingestion (private chat only)
 - `/ask <question>`: ask synchronously from your personal document base
 - `/group_add <group_id> [group_label]`: bind a Telegram group to your account
 - `/group_remove <group_id>`: remove your binding for a group
@@ -62,6 +62,7 @@ poetry run python scripts/check_openai_connection.py --chat
 - Bot can be added to groups by anyone.
 - In groups, bot answers only commands starting with `/ask` (or `/ask@BotUsername`).
 - Answer context is always taken from the account that bound this group.
+- Existing group ownership cannot be reassigned by a different account via `/group_add`.
 
 ## Group anti-spam limits
 - Group limit: up to 20 `/ask` requests per minute.
