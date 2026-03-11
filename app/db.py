@@ -32,6 +32,17 @@ def ensure_schema() -> None:
                 );
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_group_bindings (
+                    group_id BIGINT PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    group_label TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
 
 
 def create_job(job_id: str, task_name: str, payload: dict[str, Any]) -> None:
@@ -133,3 +144,68 @@ def list_jobs(owner_id: int, status: str | None = None, limit: int = 10) -> list
                     pass
         normalized.append(row)
     return normalized
+
+
+def upsert_group_binding(group_id: int, owner_id: int, group_label: str | None = None) -> dict[str, Any]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO telegram_group_bindings (group_id, owner_id, group_label)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (group_id) DO UPDATE SET
+                    owner_id = EXCLUDED.owner_id,
+                    group_label = EXCLUDED.group_label,
+                    updated_at = NOW()
+                RETURNING *;
+                """,
+                (group_id, owner_id, group_label),
+            )
+            row = cur.fetchone()
+    return row or {}
+
+
+def delete_group_binding(group_id: int, owner_id: int) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM telegram_group_bindings
+                WHERE group_id = %s AND owner_id = %s;
+                """,
+                (group_id, owner_id),
+            )
+            return cur.rowcount > 0
+
+
+def list_group_bindings(owner_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 500))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM telegram_group_bindings
+                WHERE owner_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s;
+                """,
+                (owner_id, limit),
+            )
+            rows = cur.fetchall()
+    return rows
+
+
+def get_group_binding(group_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM telegram_group_bindings
+                WHERE group_id = %s;
+                """,
+                (group_id,),
+            )
+            row = cur.fetchone()
+    return row

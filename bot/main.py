@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections import deque
 
 import httpx
 from telethon import Button
@@ -41,18 +43,22 @@ client = TelegramClient(settings.telegram_session_name, settings.telegram_api_id
 HELP_TEXT = (
     "Telegram RAG Bot\n\n"
     "How to use:\n"
-    "1. Send any text message to get an answer only from documents uploaded by you.\n"
+    "1. In private chat: send text directly or use /ask <question>.\n"
     "2. Use /ingest <text> to add raw text into the vector database.\n"
     "3. Send a file (PDF, TXT, MD, CSV, JSON, XML, source code, etc.) to ingest it.\n"
-    "4. Use /long <query> to run a long background LLM task.\n"
-    "5. Use /status <job_id> to check async task progress.\n"
-    "6. Use /jobs to browse your jobs by status and open results.\n\n"
+    "4. Bind groups in private chat via /group_add <group_id> [label].\n"
+    "5. In a bound group bot answers only to /ask <question>.\n"
+    "6. Use /long <query>, /status <job_id>, /jobs for background tasks.\n\n"
     "If no relevant context is found, bot replies: Sorry! Do not have information.\n\n"
     "Commands:\n"
     "/start - show this guide\n"
     "/help - show this guide\n"
     "/ingest <text>\n"
     "<send supported file>\n"
+    "/ask <question>\n"
+    "/group_add <group_id> [group_label]\n"
+    "/group_remove <group_id>\n"
+    "/groups\n"
     "/long <query>\n"
     "/status <job_id>\n"
     "/jobs"
@@ -60,19 +66,72 @@ HELP_TEXT = (
 
 JOB_STATUSES = ("pending", "running", "done", "failed")
 MAX_TELEGRAM_MESSAGE_LEN = 3800
+GROUP_LIMIT_WINDOW_SECONDS = 60
+GROUP_LIMIT_MAX_REQUESTS = 20
+USER_LIMIT_WINDOW_SECONDS = 60
+USER_LIMIT_MAX_REQUESTS = 5
+USER_COOLDOWN_SECONDS = 3.0
+
+GROUP_USAGE_BUCKETS: dict[int, deque[float]] = {}
+USER_USAGE_BUCKETS: dict[tuple[int, int], deque[float]] = {}
+USER_LAST_REQUEST_TS: dict[tuple[int, int], float] = {}
+
+CMD_SUFFIX = r"(?:@[\w_]+)?"
 
 
-@client.on(events.NewMessage(pattern=r"/start$"))
+def _parse_group_id(value: str) -> int:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("Group id is required")
+    try:
+        return int(cleaned)
+    except ValueError as exc:
+        raise ValueError("Group id must be numeric (example: -1001234567890)") from exc
+
+
+def _evict_old(bucket: deque[float], window_seconds: int, now_ts: float) -> None:
+    while bucket and now_ts - bucket[0] > window_seconds:
+        bucket.popleft()
+
+
+def _group_limit_exceeded(group_id: int) -> bool:
+    now_ts = time.monotonic()
+    group_bucket = GROUP_USAGE_BUCKETS.setdefault(group_id, deque())
+    _evict_old(group_bucket, GROUP_LIMIT_WINDOW_SECONDS, now_ts)
+    if len(group_bucket) >= GROUP_LIMIT_MAX_REQUESTS:
+        return True
+    group_bucket.append(now_ts)
+    return False
+
+
+def _user_limits_exceeded(group_id: int, sender_id: int) -> str | None:
+    now_ts = time.monotonic()
+    user_key = (group_id, sender_id)
+    user_bucket = USER_USAGE_BUCKETS.setdefault(user_key, deque())
+    _evict_old(user_bucket, USER_LIMIT_WINDOW_SECONDS, now_ts)
+    if len(user_bucket) >= USER_LIMIT_MAX_REQUESTS:
+        return "Too many /ask requests from your account in this group. Please wait a minute."
+
+    last_ts = USER_LAST_REQUEST_TS.get(user_key)
+    if last_ts is not None and now_ts - last_ts < USER_COOLDOWN_SECONDS:
+        return "Please wait a few seconds before sending another /ask request."
+
+    user_bucket.append(now_ts)
+    USER_LAST_REQUEST_TS[user_key] = now_ts
+    return None
+
+
+@client.on(events.NewMessage(pattern=rf"/start{CMD_SUFFIX}$"))
 async def start_handler(event: events.NewMessage.Event) -> None:
     await event.reply(HELP_TEXT)
 
 
-@client.on(events.NewMessage(pattern=r"/help$"))
+@client.on(events.NewMessage(pattern=rf"/help{CMD_SUFFIX}$"))
 async def help_handler(event: events.NewMessage.Event) -> None:
     await event.reply(HELP_TEXT)
 
 
-@client.on(events.NewMessage(pattern=r"/ingest(?:\s+([\s\S]+))?"))
+@client.on(events.NewMessage(pattern=rf"/ingest{CMD_SUFFIX}(?:\s+([\s\S]+))?"))
 async def ingest_handler(event: events.NewMessage.Event) -> None:
     text = (event.pattern_match.group(1) or "").strip()
     if not text:
@@ -113,7 +172,7 @@ async def ingest_file_handler(event: events.NewMessage.Event) -> None:
         await event.reply(f"File ingestion failed: {detail}")
 
 
-@client.on(events.NewMessage(pattern=r"/long(?:\s+([\s\S]+))?"))
+@client.on(events.NewMessage(pattern=rf"/long{CMD_SUFFIX}(?:\s+([\s\S]+))?"))
 async def long_task_handler(event: events.NewMessage.Event) -> None:
     query = (event.pattern_match.group(1) or "").strip()
     if not query:
@@ -127,7 +186,7 @@ async def long_task_handler(event: events.NewMessage.Event) -> None:
     await event.reply(f"Long LLM task queued. job_id={data['job_id']}")
 
 
-@client.on(events.NewMessage(pattern=r"/status(?:\s+([a-zA-Z0-9\-]+))?"))
+@client.on(events.NewMessage(pattern=rf"/status{CMD_SUFFIX}(?:\s+([a-zA-Z0-9\-]+))?"))
 async def status_handler(event: events.NewMessage.Event) -> None:
     job_id = (event.pattern_match.group(1) or "").strip()
     if not job_id:
@@ -188,9 +247,128 @@ def _job_result_text(job: dict) -> str:
     return text
 
 
-@client.on(events.NewMessage(pattern=r"/jobs$"))
+@client.on(events.NewMessage(pattern=rf"/jobs{CMD_SUFFIX}$"))
 async def jobs_handler(event: events.NewMessage.Event) -> None:
     await event.reply("Select status to view your jobs:", buttons=_status_keyboard())
+
+
+@client.on(events.NewMessage(pattern=rf"/group_add{CMD_SUFFIX}(?:\s+([^\s]+)(?:\s+([\s\S]+))?)?$"))
+async def group_add_handler(event: events.NewMessage.Event) -> None:
+    if not event.sender_id:
+        await event.reply("Cannot identify your user id.")
+        return
+    group_id_raw = (event.pattern_match.group(1) or "").strip()
+    group_label = (event.pattern_match.group(2) or "").strip() or None
+    if not group_id_raw:
+        await event.reply("Usage: /group_add <group_id> [group_label]")
+        return
+
+    try:
+        group_id = _parse_group_id(group_id_raw)
+    except ValueError as exc:
+        await event.reply(str(exc))
+        return
+
+    payload = {"group_id": group_id, "owner_id": event.sender_id, "group_label": group_label}
+    data = await post_json("/groups/bind", payload)
+    binding = data.get("binding") or {}
+    await event.reply(
+        f"Group bound: group_id={binding.get('group_id', group_id)} owner_id={binding.get('owner_id', event.sender_id)}"
+    )
+
+
+@client.on(events.NewMessage(pattern=rf"/group_remove{CMD_SUFFIX}(?:\s+([^\s]+))?$"))
+async def group_remove_handler(event: events.NewMessage.Event) -> None:
+    if not event.sender_id:
+        await event.reply("Cannot identify your user id.")
+        return
+    group_id_raw = (event.pattern_match.group(1) or "").strip()
+    if not group_id_raw:
+        await event.reply("Usage: /group_remove <group_id>")
+        return
+
+    try:
+        group_id = _parse_group_id(group_id_raw)
+    except ValueError as exc:
+        await event.reply(str(exc))
+        return
+
+    data = await post_json("/groups/unbind", {"group_id": group_id, "owner_id": event.sender_id})
+    if data.get("deleted"):
+        await event.reply(f"Group removed: {group_id}")
+        return
+    await event.reply("Group is not bound to your account.")
+
+
+@client.on(events.NewMessage(pattern=rf"/groups{CMD_SUFFIX}$"))
+async def groups_handler(event: events.NewMessage.Event) -> None:
+    if not event.sender_id:
+        await event.reply("Cannot identify your user id.")
+        return
+    data = await post_json("/groups/list", {"owner_id": event.sender_id, "limit": 100})
+    groups = data.get("groups", [])
+    if not groups:
+        await event.reply("No bound groups yet. Use /group_add <group_id> [group_label].")
+        return
+
+    lines = ["Your bound groups:"]
+    for item in groups:
+        label = item.get("group_label")
+        suffix = f" ({label})" if label else ""
+        lines.append(f"- {item.get('group_id')}{suffix}")
+    await event.reply("\n".join(lines))
+
+
+@client.on(events.NewMessage(pattern=rf"/ask{CMD_SUFFIX}(?:\s+([\s\S]+))?"))
+async def ask_command_handler(event: events.NewMessage.Event) -> None:
+    query = (event.pattern_match.group(1) or "").strip()
+    if not query:
+        await event.reply("Usage: /ask <question>")
+        return
+    if len(query) > 1000:
+        await event.reply("Question is too long. Please keep /ask under 1000 characters.")
+        return
+
+    is_group_chat = bool(event.is_group or event.is_channel)
+    if is_group_chat:
+        group_id = event.chat_id
+        if group_id is None:
+            await event.reply("Cannot detect group id for this message.")
+            return
+        if _group_limit_exceeded(group_id):
+            await event.reply("Group request limit reached. Please wait a minute before more /ask requests.")
+            return
+        if not event.sender_id:
+            await event.reply("Cannot identify your user id.")
+            return
+        user_limit_error = _user_limits_exceeded(group_id, event.sender_id)
+        if user_limit_error:
+            await event.reply(user_limit_error)
+            return
+
+        try:
+            resolved = await get_json("/groups/resolve", params={"group_id": group_id})
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                await event.reply("This group is not bound to any account. Add it in private chat with /group_add <group_id>.")
+                return
+            raise
+
+        binding = resolved.get("binding") or {}
+        owner_id = binding.get("owner_id")
+        if not owner_id:
+            await event.reply("Group binding is invalid. Please re-bind the group.")
+            return
+
+        data = await post_json("/ask", {"query": query, "owner_id": owner_id})
+        await event.reply(data["answer"])
+        return
+
+    if not event.sender_id:
+        await event.reply("Cannot identify your user id.")
+        return
+    data = await post_json("/ask", {"query": query, "owner_id": event.sender_id})
+    await event.reply(data["answer"])
 
 
 @client.on(events.CallbackQuery(pattern=rb"jobs:(pending|running|done|failed|all)"))
@@ -243,6 +421,8 @@ async def job_result_callback(event: events.CallbackQuery.Event) -> None:
 
 @client.on(events.NewMessage)
 async def ask_handler(event: events.NewMessage.Event) -> None:
+    if event.is_group or event.is_channel:
+        return
     if event.message and event.message.file:
         return
     text = (event.raw_text or "").strip()
