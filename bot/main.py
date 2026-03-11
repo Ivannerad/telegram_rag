@@ -44,9 +44,9 @@ HELP_TEXT = (
     "Telegram RAG Bot\n\n"
     "How to use:\n"
     "1. In private chat: send text directly or use /ask <question>.\n"
-    "2. Use /ingest <text> to add raw text into the vector database.\n"
+    "2. Use /ingest <text> to add raw text into the vector database (private or group chat).\n"
     "3. Send a file (PDF, TXT, MD, CSV, JSON, XML, source code, etc.) to ingest it.\n"
-    "4. Bind groups in private chat via /group_add <group_id> [label].\n"
+    "4. Bind groups via /group_add <group_id> [label] in private chat or /group_add [label] inside a group.\n"
     "5. In a bound group bot answers only to /ask <question>.\n"
     "6. Use /long <query>, /status <job_id>, /jobs for background tasks.\n\n"
     "If no relevant context is found, bot replies: Sorry! Do not have information.\n\n"
@@ -137,9 +137,6 @@ async def help_handler(event: events.NewMessage.Event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"/ingest{CMD_SUFFIX}(?:\s+([\s\S]+))?"))
 async def ingest_handler(event: events.NewMessage.Event) -> None:
-    if event.is_group or event.is_channel:
-        await event.reply("Use /ingest only in private chat with the bot.")
-        return
     text = (event.pattern_match.group(1) or "").strip()
     if not text:
         await event.reply("Usage: /ingest <document text>")
@@ -154,9 +151,6 @@ async def ingest_handler(event: events.NewMessage.Event) -> None:
 
 @client.on(events.NewMessage(func=lambda e: bool(getattr(e.message, "file", None))))
 async def ingest_file_handler(event: events.NewMessage.Event) -> None:
-    if event.is_group or event.is_channel:
-        await event.reply("Send files only in private chat with the bot.")
-        return
     if not event.sender_id:
         await event.reply("Cannot identify your user id.")
         return
@@ -264,23 +258,32 @@ async def jobs_handler(event: events.NewMessage.Event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"/group_add{CMD_SUFFIX}(?:\s+([^\s]+)(?:\s+([\s\S]+))?)?$"))
 async def group_add_handler(event: events.NewMessage.Event) -> None:
-    if event.is_group or event.is_channel:
-        await event.reply("Use /group_add only in private chat with the bot.")
-        return
     if not event.sender_id:
         await event.reply("Cannot identify your user id.")
         return
     group_id_raw = (event.pattern_match.group(1) or "").strip()
     group_label = (event.pattern_match.group(2) or "").strip() or None
-    if not group_id_raw:
-        await event.reply("Usage: /group_add <group_id> [group_label]")
-        return
-
-    try:
-        group_id = _parse_group_id(group_id_raw)
-    except ValueError as exc:
-        await event.reply(str(exc))
-        return
+    if event.is_group or event.is_channel:
+        if group_id_raw:
+            try:
+                group_id = _parse_group_id(group_id_raw)
+            except ValueError as exc:
+                await event.reply(str(exc))
+                return
+        else:
+            group_id = event.chat_id
+            if group_id is None:
+                await event.reply("Cannot detect this group id.")
+                return
+    else:
+        if not group_id_raw:
+            await event.reply("Usage: /group_add <group_id> [group_label]")
+            return
+        try:
+            group_id = _parse_group_id(group_id_raw)
+        except ValueError as exc:
+            await event.reply(str(exc))
+            return
 
     payload = {"group_id": group_id, "owner_id": event.sender_id, "group_label": group_label}
     try:
