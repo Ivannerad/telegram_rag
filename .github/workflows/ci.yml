@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Unit/API Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      API_INTERNAL_TOKEN: ${{ secrets.API_INTERNAL_TOKEN }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+      OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "poetry"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction --no-root
+
+      - name: Run non-integration tests
+        run: poetry run pytest -q -m "not integration"
+
+  e2e:
+    name: Docker E2E API Tests
+    runs-on: ubuntu-latest
+    needs: tests
+    timeout-minutes: 30
+    env:
+      RUN_DOCKER_TESTS: "1"
+      DOCKER_BUILDKIT: "1"
+      COMPOSE_DOCKER_CLI_BUILD: "1"
+      API_INTERNAL_TOKEN: ${{ secrets.API_INTERNAL_TOKEN }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+      OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "poetry"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction --no-root
+
+      - name: Write .env from CI secrets
+        run: |
+          cat > .env <<EOF
+          API_INTERNAL_TOKEN=${API_INTERNAL_TOKEN}
+          LLM_API_KEY=${LLM_API_KEY}
+          OPENAI_API_KEY=${OPENAI_API_KEY}
+          OPENAI_BASE_URL=${OPENAI_BASE_URL}
+          OPENAI_MODEL=${OPENAI_MODEL}
+          OPENAI_EMBEDDING_MODEL=${OPENAI_EMBEDDING_MODEL}
+          TELEGRAM_API_ID=${TELEGRAM_API_ID}
+          TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          EOF
+
+      - name: Run Docker compose endpoint E2E tests
+        run: poetry run pytest -q -m integration tests/test_functional_compose.py
