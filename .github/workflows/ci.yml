@@ -18,16 +18,6 @@ jobs:
     name: Unit/API Tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      API_INTERNAL_TOKEN: ${{ secrets.API_INTERNAL_TOKEN }}
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-      OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
-      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,15 +82,15 @@ jobs:
       - name: Write .env from CI secrets
         run: |
           cat > .env <<EOF
-          API_INTERNAL_TOKEN=${API_INTERNAL_TOKEN}
-          LLM_API_KEY=${LLM_API_KEY}
-          OPENAI_API_KEY=${OPENAI_API_KEY}
-          OPENAI_BASE_URL=${OPENAI_BASE_URL}
-          OPENAI_MODEL=${OPENAI_MODEL}
-          OPENAI_EMBEDDING_MODEL=${OPENAI_EMBEDDING_MODEL}
-          TELEGRAM_API_ID=${TELEGRAM_API_ID}
-          TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
-          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          API_INTERNAL_TOKEN=${API_INTERNAL_TOKEN:-change_me}
+          LLM_API_KEY=${LLM_API_KEY:-}
+          OPENAI_API_KEY=${OPENAI_API_KEY:-}
+          OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+          OPENAI_MODEL=${OPENAI_MODEL:-gpt-5}
+          OPENAI_EMBEDDING_MODEL=${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
+          TELEGRAM_API_ID=${TELEGRAM_API_ID:-1}
+          TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-dummy}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-dummy}
           EOF
 
       - name: Run Docker compose endpoint E2E tests
