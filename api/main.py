@@ -45,6 +45,22 @@ class TaskListRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
 
 
+class GroupBindRequest(BaseModel):
+    owner_id: int = Field(gt=0)
+    group_id: int
+    group_label: str | None = Field(default=None, max_length=255)
+
+
+class GroupUnbindRequest(BaseModel):
+    owner_id: int = Field(gt=0)
+    group_id: int
+
+
+class GroupListRequest(BaseModel):
+    owner_id: int = Field(gt=0)
+    limit: int = Field(default=50, ge=1, le=500)
+
+
 def verify_internal_token(x_internal_token: Annotated[str | None, Header()] = None) -> None:
     settings = get_settings()
     if x_internal_token != settings.api_internal_token:
@@ -190,3 +206,39 @@ def list_tasks(payload: TaskListRequest) -> dict:
         "limit": payload.limit,
         "jobs": jobs,
     }
+
+
+@app.post("/groups/bind", dependencies=[Depends(verify_internal_token)])
+def bind_group(payload: GroupBindRequest) -> dict:
+    binding = db.upsert_group_binding(
+        group_id=payload.group_id,
+        owner_id=payload.owner_id,
+        group_label=payload.group_label,
+    )
+    if binding is None:
+        raise HTTPException(status_code=409, detail="Group is already bound to another owner")
+    return {"binding": binding}
+
+
+@app.post("/groups/unbind", dependencies=[Depends(verify_internal_token)])
+def unbind_group(payload: GroupUnbindRequest) -> dict:
+    deleted = db.delete_group_binding(group_id=payload.group_id, owner_id=payload.owner_id)
+    return {"deleted": deleted}
+
+
+@app.post("/groups/list", dependencies=[Depends(verify_internal_token)])
+def list_groups(payload: GroupListRequest) -> dict:
+    bindings = db.list_group_bindings(owner_id=payload.owner_id, limit=payload.limit)
+    return {
+        "owner_id": payload.owner_id,
+        "limit": payload.limit,
+        "groups": bindings,
+    }
+
+
+@app.get("/groups/resolve", dependencies=[Depends(verify_internal_token)])
+def resolve_group(group_id: int) -> dict:
+    binding = db.get_group_binding(group_id=group_id)
+    if binding is None:
+        raise HTTPException(status_code=404, detail="Group is not bound to any owner")
+    return {"binding": binding}

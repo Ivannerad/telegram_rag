@@ -45,12 +45,30 @@ poetry run python scripts/check_openai_connection.py --chat
 ```
 
 ## Telegram commands
-- `/ingest <text>`: enqueue document ingestion
+- `/ingest <text>`: enqueue document ingestion (private and group chats)
 - send supported file attachment (PDF/TXT/MD/CSV/JSON/XML/code): extract text then enqueue ingestion
+- `/ask <question>`: ask synchronously from your personal document base
+- `/group_add <group_id> [group_label]`: bind a Telegram group to your account
+- `/group_remove <group_id>`: remove your binding for a group
+- `/groups`: list groups bound to your account
 - `/long <query>`: enqueue long LLM task
 - `/status <job_id>`: check background task status
 - `/jobs`: open inline buttons to browse your jobs by status and open result details
-- any plain text message: synchronous `/ask` call
+- any plain text message in private chat: synchronous `/ask` call
+
+## Group Q&A flow
+- User uploads documents in private chat or group chats.
+- User binds one or more Telegram groups using `/group_add <group_id>` in private chat, or `/group_add` directly inside a group.
+- Bot can be added to groups by anyone.
+- In groups, bot answers only commands starting with `/ask` (or `/ask@BotUsername`).
+- Answer context is always taken from the account that bound this group.
+- Existing group ownership cannot be reassigned by a different account via `/group_add`.
+
+## Group anti-spam limits
+- Group limit: up to 20 `/ask` requests per minute.
+- Per-user in group limit: up to 5 `/ask` requests per minute.
+- Cooldown: at least 3 seconds between requests for the same user in a group.
+- Query length limit in `/ask`: 1000 characters.
 
 ## API endpoints
 - `GET /health`
@@ -61,6 +79,10 @@ poetry run python scripts/check_openai_connection.py --chat
 - `POST /tasks/search`
 - `POST /tasks/list`
 - `GET /tasks/{job_id}`
+- `POST /groups/bind`
+- `POST /groups/unbind`
+- `POST /groups/list`
+- `GET /groups/resolve`
 
 All non-health endpoints require header:
 - `X-Internal-Token: <API_INTERNAL_TOKEN>`
