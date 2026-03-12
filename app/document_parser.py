@@ -3,10 +3,12 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 
-from pypdf import PdfReader
-
 
 class UnsupportedDocumentTypeError(ValueError):
+    pass
+
+
+class ParserDependencyError(RuntimeError):
     pass
 
 
@@ -56,6 +58,11 @@ def _decode_text(raw: bytes) -> str:
 
 
 def _extract_pdf_text(raw: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ModuleNotFoundError as exc:
+        raise ParserDependencyError("PDF parsing requires dependency 'pypdf'") from exc
+
     reader = PdfReader(BytesIO(raw))
     parts: list[str] = []
     for page in reader.pages:
