@@ -44,9 +44,9 @@ HELP_TEXT = (
     "Telegram RAG Bot\n\n"
     "How to use:\n"
     "1. In private chat: send text directly or use /ask <question>.\n"
-    "2. Use /ingest <text> to add raw text into the vector database.\n"
+    "2. Use /ingest <text> to add raw text into the vector database (private or group chat).\n"
     "3. Send a file (PDF, TXT, MD, CSV, JSON, XML, source code, etc.) to ingest it.\n"
-    "4. Bind groups in private chat via /group_add <group_id> [label].\n"
+    "4. Bind groups via /group_add <group_id> [label] in private chat or /group_add [label] inside a group.\n"
     "5. In a bound group bot answers only to /ask <question>.\n"
     "6. Use /long <query>, /status <job_id>, /jobs for background tasks.\n\n"
     "If no relevant context is found, bot replies: Sorry! Do not have information.\n\n"
@@ -98,10 +98,14 @@ def _group_limit_exceeded(group_id: int) -> bool:
     now_ts = time.monotonic()
     group_bucket = GROUP_USAGE_BUCKETS.setdefault(group_id, deque())
     _evict_old(group_bucket, GROUP_LIMIT_WINDOW_SECONDS, now_ts)
-    if len(group_bucket) >= GROUP_LIMIT_MAX_REQUESTS:
-        return True
+    return len(group_bucket) >= GROUP_LIMIT_MAX_REQUESTS
+
+
+def _consume_group_limit(group_id: int) -> None:
+    now_ts = time.monotonic()
+    group_bucket = GROUP_USAGE_BUCKETS.setdefault(group_id, deque())
+    _evict_old(group_bucket, GROUP_LIMIT_WINDOW_SECONDS, now_ts)
     group_bucket.append(now_ts)
-    return False
 
 
 def _user_limits_exceeded(group_id: int, sender_id: int) -> str | None:
@@ -259,18 +263,36 @@ async def group_add_handler(event: events.NewMessage.Event) -> None:
         return
     group_id_raw = (event.pattern_match.group(1) or "").strip()
     group_label = (event.pattern_match.group(2) or "").strip() or None
-    if not group_id_raw:
-        await event.reply("Usage: /group_add <group_id> [group_label]")
-        return
-
-    try:
-        group_id = _parse_group_id(group_id_raw)
-    except ValueError as exc:
-        await event.reply(str(exc))
-        return
+    if event.is_group or event.is_channel:
+        if group_id_raw:
+            try:
+                group_id = _parse_group_id(group_id_raw)
+            except ValueError as exc:
+                await event.reply(str(exc))
+                return
+        else:
+            group_id = event.chat_id
+            if group_id is None:
+                await event.reply("Cannot detect this group id.")
+                return
+    else:
+        if not group_id_raw:
+            await event.reply("Usage: /group_add <group_id> [group_label]")
+            return
+        try:
+            group_id = _parse_group_id(group_id_raw)
+        except ValueError as exc:
+            await event.reply(str(exc))
+            return
 
     payload = {"group_id": group_id, "owner_id": event.sender_id, "group_label": group_label}
-    data = await post_json("/groups/bind", payload)
+    try:
+        data = await post_json("/groups/bind", payload)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 409:
+            await event.reply("This group is already bound to another account.")
+            return
+        raise
     binding = data.get("binding") or {}
     await event.reply(
         f"Group bound: group_id={binding.get('group_id', group_id)} owner_id={binding.get('owner_id', event.sender_id)}"
@@ -335,15 +357,8 @@ async def ask_command_handler(event: events.NewMessage.Event) -> None:
         if group_id is None:
             await event.reply("Cannot detect group id for this message.")
             return
-        if _group_limit_exceeded(group_id):
-            await event.reply("Group request limit reached. Please wait a minute before more /ask requests.")
-            return
         if not event.sender_id:
             await event.reply("Cannot identify your user id.")
-            return
-        user_limit_error = _user_limits_exceeded(group_id, event.sender_id)
-        if user_limit_error:
-            await event.reply(user_limit_error)
             return
 
         try:
@@ -359,6 +374,14 @@ async def ask_command_handler(event: events.NewMessage.Event) -> None:
         if not owner_id:
             await event.reply("Group binding is invalid. Please re-bind the group.")
             return
+        if _group_limit_exceeded(group_id):
+            await event.reply("Group request limit reached. Please wait a minute before more /ask requests.")
+            return
+        user_limit_error = _user_limits_exceeded(group_id, event.sender_id)
+        if user_limit_error:
+            await event.reply(user_limit_error)
+            return
+        _consume_group_limit(group_id)
 
         data = await post_json("/ask", {"query": query, "owner_id": owner_id})
         await event.reply(data["answer"])

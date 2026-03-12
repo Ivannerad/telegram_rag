@@ -146,7 +146,7 @@ def list_jobs(owner_id: int, status: str | None = None, limit: int = 10) -> list
     return normalized
 
 
-def upsert_group_binding(group_id: int, owner_id: int, group_label: str | None = None) -> dict[str, Any]:
+def upsert_group_binding(group_id: int, owner_id: int, group_label: str | None = None) -> dict[str, Any] | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -154,15 +154,15 @@ def upsert_group_binding(group_id: int, owner_id: int, group_label: str | None =
                 INSERT INTO telegram_group_bindings (group_id, owner_id, group_label)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (group_id) DO UPDATE SET
-                    owner_id = EXCLUDED.owner_id,
                     group_label = EXCLUDED.group_label,
                     updated_at = NOW()
+                WHERE telegram_group_bindings.owner_id = EXCLUDED.owner_id
                 RETURNING *;
                 """,
                 (group_id, owner_id, group_label),
             )
             row = cur.fetchone()
-    return row or {}
+    return row
 
 
 def delete_group_binding(group_id: int, owner_id: int) -> bool:

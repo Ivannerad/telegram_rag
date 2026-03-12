@@ -215,6 +215,8 @@ def bind_group(payload: GroupBindRequest) -> dict:
         owner_id=payload.owner_id,
         group_label=payload.group_label,
     )
+    if binding is None:
+        raise HTTPException(status_code=409, detail="Group is already bound to another owner")
     return {"binding": binding}
 
 
