@@ -46,7 +46,7 @@ jobs:
           installer-parallel: true
 
       - name: Install dependencies
-        run: poetry install --with dev --no-interaction --no-root
+        run: poetry install --all-groups --no-interaction --no-root
 
       - name: Run non-integration tests
         run: poetry run pytest -q -m "not integration"
@@ -87,7 +87,7 @@ jobs:
           installer-parallel: true
 
       - name: Install dependencies
-        run: poetry install --with dev --no-interaction --no-root
+        run: poetry install --all-groups --no-interaction --no-root
 
       - name: Write .env from CI secrets
         run: |
