@@ -192,6 +192,7 @@ def _cleanup_owner(stack: ComposeStack, owner_id: int) -> None:
     with psycopg.connect(stack.postgres_dsn, row_factory=psycopg.rows.dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM bg_jobs WHERE payload->>'owner_id' = %s", (str(owner_id),))
+            cur.execute("DELETE FROM telegram_group_bindings WHERE owner_id = %s", (owner_id,))
 
     qdrant = QdrantClient(url=stack.qdrant_url, check_compatibility=False)
     filter_by_owner = qdrant_models.Filter(
@@ -254,6 +255,10 @@ def _wait_for_worker_readiness(stack: ComposeStack) -> None:
             raise AssertionError(f"Worker readiness smoke job failed: {job}")
     finally:
         _cleanup_owner(stack, owner_id)
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"x-internal-token": INTERNAL_TOKEN}
 
 
 @pytest.fixture(scope="session")
@@ -367,3 +372,173 @@ def test_compose_search_pipeline(compose_stack: ComposeStack, owner_id: int) -> 
     matches = (search_job.get("result") or {}).get("matches") or []
     assert matches
     assert any((match or {}).get("document_id") == document_id for match in matches)
+
+
+@pytest.mark.integration
+def test_compose_task_status_owner_mismatch_returns_404(compose_stack: ComposeStack, owner_id: int) -> None:
+    job_id = _enqueue_ingest(
+        compose_stack,
+        owner_id=owner_id,
+        document_id=f"mismatch-doc-{uuid.uuid4().hex[:10]}",
+        text="owner mismatch endpoint test payload",
+    )
+    wrong_owner = owner_id + 1
+
+    response = httpx.get(
+        f"{compose_stack.api_base_url}/tasks/{job_id}",
+        params={"owner_id": wrong_owner},
+        headers=_auth_headers(),
+        timeout=10.0,
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+
+
+@pytest.mark.integration
+def test_compose_tasks_list_returns_owner_jobs(compose_stack: ComposeStack, owner_id: int) -> None:
+    ingest_job_id = _enqueue_ingest(
+        compose_stack,
+        owner_id=owner_id,
+        document_id=f"list-ingest-doc-{uuid.uuid4().hex[:10]}",
+        text="tasks list coverage ingest payload",
+    )
+    ingest_job = _wait_for_job_terminal(compose_stack, job_id=ingest_job_id, owner_id=owner_id)
+    assert ingest_job["status"] == "done"
+
+    search_job_id = _enqueue_search(compose_stack, owner_id=owner_id, query="tasks list coverage", limit=3)
+    search_job = _wait_for_job_terminal(compose_stack, job_id=search_job_id, owner_id=owner_id)
+    assert search_job["status"] == "done"
+
+    response = httpx.post(
+        f"{compose_stack.api_base_url}/tasks/list",
+        headers=_auth_headers(),
+        json={"owner_id": owner_id, "status": "done", "limit": 10},
+        timeout=10.0,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["owner_id"] == owner_id
+    assert payload["status"] == "done"
+    assert payload["limit"] == 10
+    jobs = payload["jobs"]
+    assert isinstance(jobs, list)
+    job_ids = {job["job_id"] for job in jobs}
+    assert ingest_job_id in job_ids
+    assert search_job_id in job_ids
+    assert all((job.get("payload") or {}).get("owner_id") == owner_id for job in jobs)
+
+
+@pytest.mark.integration
+def test_compose_group_binding_flow(compose_stack: ComposeStack, owner_id: int) -> None:
+    group_id = -int(uuid.uuid4().int % 2_000_000_000) - 1
+    group_label = f"it-group-{uuid.uuid4().hex[:8]}"
+
+    bind_response = httpx.post(
+        f"{compose_stack.api_base_url}/groups/bind",
+        headers=_auth_headers(),
+        json={"owner_id": owner_id, "group_id": group_id, "group_label": group_label},
+        timeout=10.0,
+    )
+    assert bind_response.status_code == 200, bind_response.text
+    binding = bind_response.json()["binding"]
+    assert binding["group_id"] == group_id
+    assert binding["owner_id"] == owner_id
+    assert binding["group_label"] == group_label
+
+    list_response = httpx.post(
+        f"{compose_stack.api_base_url}/groups/list",
+        headers=_auth_headers(),
+        json={"owner_id": owner_id, "limit": 20},
+        timeout=10.0,
+    )
+    assert list_response.status_code == 200, list_response.text
+    groups_payload = list_response.json()
+    assert groups_payload["owner_id"] == owner_id
+    assert groups_payload["limit"] == 20
+    groups = groups_payload["groups"]
+    assert any(group["group_id"] == group_id and group["owner_id"] == owner_id for group in groups)
+
+    resolve_response = httpx.get(
+        f"{compose_stack.api_base_url}/groups/resolve",
+        headers=_auth_headers(),
+        params={"group_id": group_id},
+        timeout=10.0,
+    )
+    assert resolve_response.status_code == 200, resolve_response.text
+    resolved = resolve_response.json()["binding"]
+    assert resolved["group_id"] == group_id
+    assert resolved["owner_id"] == owner_id
+    assert resolved["group_label"] == group_label
+
+    unbind_response = httpx.post(
+        f"{compose_stack.api_base_url}/groups/unbind",
+        headers=_auth_headers(),
+        json={"owner_id": owner_id, "group_id": group_id},
+        timeout=10.0,
+    )
+    assert unbind_response.status_code == 200, unbind_response.text
+    assert unbind_response.json() == {"deleted": True}
+
+    resolve_after_unbind = httpx.get(
+        f"{compose_stack.api_base_url}/groups/resolve",
+        headers=_auth_headers(),
+        params={"group_id": group_id},
+        timeout=10.0,
+    )
+    assert resolve_after_unbind.status_code == 404
+    assert resolve_after_unbind.json() == {"detail": "Group is not bound to any owner"}
+
+
+@pytest.mark.integration
+def test_compose_ingest_file_text_path(compose_stack: ComposeStack, owner_id: int) -> None:
+    needle = f"INGEST_FILE_NEEDLE_{uuid.uuid4().hex[:10]}"
+    document_id = f"ingest-file-doc-{uuid.uuid4().hex[:10]}"
+    upload_text = f"Compose ingest-file text/plain path check: {needle}"
+
+    ingest_response = httpx.post(
+        f"{compose_stack.api_base_url}/tasks/ingest-file",
+        headers=_auth_headers(),
+        data={"owner_id": str(owner_id), "source": "functional-test", "document_id": document_id},
+        files={"file": ("functional.txt", upload_text.encode("utf-8"), "text/plain")},
+        timeout=20.0,
+    )
+    assert ingest_response.status_code == 200, ingest_response.text
+    ingest_job_id = ingest_response.json()["job_id"]
+
+    ingest_job = _wait_for_job_terminal(compose_stack, job_id=ingest_job_id, owner_id=owner_id)
+    assert ingest_job["status"] == "done"
+    assert ingest_job["task_name"] == "tasks.ingest_document"
+    assert ingest_job["result"]["document_id"] == document_id
+    assert ingest_job["result"]["owner_id"] == owner_id
+
+    search_job_id = _enqueue_search(compose_stack, owner_id=owner_id, query=needle, limit=5)
+    search_job = _wait_for_job_terminal(compose_stack, job_id=search_job_id, owner_id=owner_id)
+    assert search_job["status"] == "done"
+    matches = (search_job.get("result") or {}).get("matches") or []
+    assert any((match or {}).get("document_id") == document_id for match in matches)
+
+
+
+@pytest.mark.integration
+def test_compose_ask_endpoint_returns_contextual_match(compose_stack: ComposeStack, owner_id: int) -> None:
+    needle = f"ASK_NEEDLE_{uuid.uuid4().hex[:10]}"
+    document_id = f"ask-doc-{uuid.uuid4().hex[:10]}"
+    ingest_text = f"Ask endpoint coverage text with unique marker: {needle}."
+
+    ingest_job_id = _enqueue_ingest(compose_stack, owner_id=owner_id, document_id=document_id, text=ingest_text)
+    ingest_job = _wait_for_job_terminal(compose_stack, job_id=ingest_job_id, owner_id=owner_id)
+    assert ingest_job["status"] == "done"
+
+    ask_response = httpx.post(
+        f"{compose_stack.api_base_url}/ask",
+        headers=_auth_headers(),
+        json={"query": needle, "owner_id": owner_id},
+        timeout=10.0,
+    )
+    assert ask_response.status_code == 200, ask_response.text
+    payload = ask_response.json()
+    assert payload["owner_id"] == owner_id
+    assert payload["query"] == needle
+    assert payload["answer"]
+    assert any((match or {}).get("document_id") == document_id for match in payload.get("matches") or [])
