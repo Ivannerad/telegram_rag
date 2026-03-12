@@ -123,6 +123,24 @@ def test_tasks_ingest(monkeypatch) -> None:
     )
 
 
+def test_tasks_ingest_requires_auth(monkeypatch) -> None:
+    create_job = Mock()
+    send_task = Mock()
+    monkeypatch.setattr(main.db, "create_job", create_job)
+    monkeypatch.setattr(main.celery_app, "send_task", send_task)
+
+    with make_client(monkeypatch) as client:
+        response = client.post(
+            "/tasks/ingest",
+            json={"source": "telegram", "text": "hello world", "owner_id": 7},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid internal token"}
+    create_job.assert_not_called()
+    send_task.assert_not_called()
+
+
 def test_tasks_ingest_file_success(monkeypatch) -> None:
     create_job = Mock()
     send_task = Mock()
@@ -164,6 +182,28 @@ def test_tasks_ingest_file_success(monkeypatch) -> None:
             "owner_id": 11,
         },
     )
+
+
+def test_tasks_ingest_file_requires_auth(monkeypatch) -> None:
+    create_job = Mock()
+    send_task = Mock()
+    extract_text = Mock(return_value="parsed text")
+    monkeypatch.setattr(main.db, "create_job", create_job)
+    monkeypatch.setattr(main.celery_app, "send_task", send_task)
+    monkeypatch.setattr(main, "extract_text_from_document", extract_text)
+
+    with make_client(monkeypatch) as client:
+        response = client.post(
+            "/tasks/ingest-file",
+            data={"owner_id": "11", "source": "telegram"},
+            files={"file": ("notes.txt", b"raw-bytes", "text/plain")},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid internal token"}
+    create_job.assert_not_called()
+    send_task.assert_not_called()
+    extract_text.assert_not_called()
 
 
 def test_tasks_ingest_file_unsupported_type(monkeypatch) -> None:
@@ -280,7 +320,7 @@ def test_task_status_not_found(monkeypatch) -> None:
     monkeypatch.setattr(main.db, "get_job", lambda _job_id: None)
 
     with make_client(monkeypatch) as client:
-        response = client.get("/tasks/missing", headers=auth_headers())
+        response = client.get("/tasks/missing", headers=auth_headers(), params={"owner_id": 1})
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Job not found"}
@@ -321,6 +361,17 @@ def test_task_status_success_with_owner_id_match(monkeypatch) -> None:
     assert response.json() == job
 
 
+def test_task_status_requires_owner_id(monkeypatch) -> None:
+    get_job = Mock()
+    monkeypatch.setattr(main.db, "get_job", get_job)
+
+    with make_client(monkeypatch) as client:
+        response = client.get("/tasks/abc", headers=auth_headers())
+
+    assert response.status_code == 422
+    get_job.assert_not_called()
+
+
 def test_tasks_list(monkeypatch) -> None:
     list_jobs = Mock(return_value=[{"job_id": "j-1", "status": "pending"}])
     monkeypatch.setattr(main.db, "list_jobs", list_jobs)
@@ -340,6 +391,33 @@ def test_tasks_list(monkeypatch) -> None:
         "jobs": [{"job_id": "j-1", "status": "pending"}],
     }
     list_jobs.assert_called_once_with(owner_id=42, status="pending", limit=5)
+
+
+def test_tasks_list_limit_too_large(monkeypatch) -> None:
+    with make_client(monkeypatch) as client:
+        response = client.post(
+            "/tasks/list",
+            headers=auth_headers(),
+            json={"owner_id": 42, "limit": 51},
+        )
+
+    assert response.status_code == 422
+
+
+def test_groups_bind_success(monkeypatch) -> None:
+    upsert_group_binding = Mock(return_value={"group_id": -1001234, "owner_id": 42, "group_label": "Team"})
+    monkeypatch.setattr(main.db, "upsert_group_binding", upsert_group_binding)
+
+    with make_client(monkeypatch) as client:
+        response = client.post(
+            "/groups/bind",
+            headers=auth_headers(),
+            json={"owner_id": 42, "group_id": -1001234, "group_label": "Team"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"binding": {"group_id": -1001234, "owner_id": 42, "group_label": "Team"}}
+    upsert_group_binding.assert_called_once_with(group_id=-1001234, owner_id=42, group_label="Team")
 
 
 def test_groups_bind_conflict(monkeypatch) -> None:
@@ -407,3 +485,15 @@ def test_groups_resolve_not_found(monkeypatch) -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Group is not bound to any owner"}
+
+
+def test_groups_resolve_requires_auth(monkeypatch) -> None:
+    get_group_binding = Mock()
+    monkeypatch.setattr(main.db, "get_group_binding", get_group_binding)
+
+    with make_client(monkeypatch) as client:
+        response = client.get("/groups/resolve", params={"group_id": -100999})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid internal token"}
+    get_group_binding.assert_not_called()

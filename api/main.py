@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from app import business, db
@@ -191,15 +191,14 @@ def enqueue_search(payload: SearchRequest) -> dict:
 
 
 @app.get("/tasks/{job_id}", dependencies=[Depends(verify_internal_token)])
-def task_status(job_id: str, owner_id: int | None = None) -> dict:
+def task_status(job_id: str, owner_id: int = Query(gt=0)) -> dict:
     job = db.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if owner_id is not None:
-        payload = job.get("payload") or {}
-        job_owner_id = payload.get("owner_id")
-        if str(job_owner_id) != str(owner_id):
-            raise HTTPException(status_code=404, detail="Job not found")
+    payload = job.get("payload") or {}
+    job_owner_id = payload.get("owner_id")
+    if str(job_owner_id) != str(owner_id):
+        raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
