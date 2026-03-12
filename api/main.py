@@ -8,7 +8,11 @@ from pydantic import BaseModel, Field
 
 from app import business, db
 from app.config import get_settings
-from app.document_parser import UnsupportedDocumentTypeError, extract_text_from_document
+from app.document_parser import (
+    ParserDependencyError,
+    UnsupportedDocumentTypeError,
+    extract_text_from_document,
+)
 from app.logging_setup import configure_logging
 from worker.celery_app import celery_app
 
@@ -127,6 +131,8 @@ async def enqueue_ingest_file(
     raw = await file.read()
     try:
         text = extract_text_from_document(filename=file.filename, content_type=file.content_type, raw=raw)
+    except ParserDependencyError:
+        raise HTTPException(status_code=500, detail="File parsing is temporarily unavailable")
     except UnsupportedDocumentTypeError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     except ValueError as exc:
