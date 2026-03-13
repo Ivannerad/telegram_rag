@@ -4,11 +4,13 @@ import asyncio
 import json
 import time
 from collections import deque
+from typing import Any, Awaitable
 
 import httpx
 from telethon import Button
 from telethon import TelegramClient, events
 
+from app.business import NO_INFO_RESPONSE
 from app.config import get_settings
 
 
@@ -49,7 +51,7 @@ HELP_TEXT = (
     "4. Bind groups via /group_add <group_id> [label] in private chat or /group_add [label] inside a group.\n"
     "5. In a bound group bot answers only to /ask <question>.\n"
     "6. Use /long <query>, /status <job_id>, /jobs for background tasks.\n\n"
-    "If no relevant context is found, bot replies: Sorry! Do not have information.\n\n"
+    f"If no relevant context is found, bot replies: {NO_INFO_RESPONSE}\n\n"
     "Commands:\n"
     "/start - show this guide\n"
     "/help - show this guide\n"
@@ -57,7 +59,7 @@ HELP_TEXT = (
     "<send supported file>\n"
     "/ask <question>\n"
     "/group_add <group_id> [group_label]\n"
-    "/group_remove <group_id>\n"
+    "/group_remove <group_id> (or /group_remove in a group chat)\n"
     "/groups\n"
     "/long <query>\n"
     "/status <job_id>\n"
@@ -77,6 +79,9 @@ USER_USAGE_BUCKETS: dict[tuple[int, int], deque[float]] = {}
 USER_LAST_REQUEST_TS: dict[tuple[int, int], float] = {}
 
 CMD_SUFFIX = r"(?:@[\w_]+)?"
+API_UNAVAILABLE_MESSAGE = "Backend service is temporarily unavailable. Please try again in a moment."
+API_ERROR_MESSAGE = "Backend request failed. Please try again in a moment."
+MAX_CALLBACK_ALERT_LEN = 200
 
 
 def _parse_group_id(value: str) -> int:
@@ -87,6 +92,52 @@ def _parse_group_id(value: str) -> int:
         return int(cleaned)
     except ValueError as exc:
         raise ValueError("Group id must be numeric (example: -1001234567890)") from exc
+
+
+def _http_error_detail(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+    raw = (response.text or "").strip()
+    return raw or None
+
+
+async def _safe_api_call(
+    event: Any,
+    api_call: Awaitable[dict],
+    *,
+    status_messages: dict[int, str] | None = None,
+) -> dict | None:
+    async def send_message(text: str) -> None:
+        if hasattr(event, "answer"):
+            alert_text = text[:MAX_CALLBACK_ALERT_LEN]
+            await event.answer(alert_text, alert=True)
+            return
+        if hasattr(event, "reply"):
+            await event.reply(text)
+
+    try:
+        return await api_call
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        if status_messages and status_code in status_messages:
+            await send_message(status_messages[status_code])
+            return None
+        detail = _http_error_detail(exc.response)
+        if detail:
+            detail = detail[:200]
+            await send_message(f"{API_ERROR_MESSAGE} (HTTP {status_code}: {detail})")
+        else:
+            await send_message(f"{API_ERROR_MESSAGE} (HTTP {status_code}).")
+        return None
+    except httpx.RequestError:
+        await send_message(API_UNAVAILABLE_MESSAGE)
+        return None
 
 
 def _evict_old(bucket: deque[float], window_seconds: int, now_ts: float) -> None:
@@ -145,8 +196,14 @@ async def ingest_handler(event: events.NewMessage.Event) -> None:
         await event.reply("Cannot identify your user id.")
         return
 
-    data = await post_json("/tasks/ingest", {"source": "telegram", "text": text, "owner_id": event.sender_id})
-    await event.reply(f"Ingestion queued. job_id={data['job_id']}")
+    data = await _safe_api_call(
+        event,
+        post_json("/tasks/ingest", {"source": "telegram", "text": text, "owner_id": event.sender_id}),
+    )
+    if not data:
+        return
+    job_id = data.get("job_id")
+    await event.reply(f"Ingestion queued. job_id={job_id}\nNext: /status {job_id} or /jobs")
 
 
 @client.on(events.NewMessage(func=lambda e: bool(getattr(e.message, "file", None))))
@@ -164,16 +221,18 @@ async def ingest_file_handler(event: events.NewMessage.Event) -> None:
         await event.reply("Could not download file content.")
         return
 
-    try:
-        data = await post_multipart(
+    data = await _safe_api_call(
+        event,
+        post_multipart(
             "/tasks/ingest-file",
             data={"source": "telegram", "owner_id": str(event.sender_id)},
             files={"file": (file_name or "upload.bin", payload, mime_type)},
-        )
-        await event.reply(f"File ingestion queued. job_id={data['job_id']}")
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text
-        await event.reply(f"File ingestion failed: {detail}")
+        ),
+    )
+    if not data:
+        return
+    job_id = data.get("job_id")
+    await event.reply(f"File ingestion queued. job_id={job_id}\nNext: /status {job_id} or /jobs")
 
 
 @client.on(events.NewMessage(pattern=rf"/long{CMD_SUFFIX}(?:\s+([\s\S]+))?"))
@@ -186,7 +245,9 @@ async def long_task_handler(event: events.NewMessage.Event) -> None:
         await event.reply("Cannot identify your user id.")
         return
 
-    data = await post_json("/tasks/llm", {"query": query, "owner_id": event.sender_id})
+    data = await _safe_api_call(event, post_json("/tasks/llm", {"query": query, "owner_id": event.sender_id}))
+    if not data:
+        return
     await event.reply(f"Long LLM task queued. job_id={data['job_id']}")
 
 
@@ -200,13 +261,13 @@ async def status_handler(event: events.NewMessage.Event) -> None:
         await event.reply("Cannot identify your user id.")
         return
 
-    try:
-        payload = await get_json(f"/tasks/{job_id}", params={"owner_id": event.sender_id})
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            await event.reply("Job not found")
-            return
-        raise
+    payload = await _safe_api_call(
+        event,
+        get_json(f"/tasks/{job_id}", params={"owner_id": event.sender_id}),
+        status_messages={404: "Job not found"},
+    )
+    if not payload:
+        return
 
     await event.reply(f"job_id={payload['job_id']} status={payload['status']}")
 
@@ -231,20 +292,62 @@ def _short_job_line(job: dict) -> str:
 
 
 def _job_result_text(job: dict) -> str:
+    task_name = str(job.get("task_name") or "")
+    task_short = task_name.replace("tasks.", "") if task_name else "unknown"
     parts: list[str] = [
-        f"job_id={job.get('job_id')}",
-        f"status={job.get('status')}",
-        f"task={job.get('task_name')}",
+        "Job details",
+        f"- ID: {job.get('job_id')}",
+        f"- Status: {job.get('status')}",
+        f"- Task: {task_short}",
     ]
-    payload = job.get("payload")
-    if payload:
-        parts.append(f"payload={json.dumps(payload, ensure_ascii=True)}")
-    result = job.get("result")
-    if result is not None:
-        parts.append(f"result={json.dumps(result, ensure_ascii=True)}")
+
+    summary_lines: list[str] = []
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    result = job.get("result") if isinstance(job.get("result"), dict) else None
+    if task_name == "tasks.ingest_document":
+        source = payload.get("source")
+        document_id = (result or {}).get("document_id") or payload.get("document_id")
+        chunks = (result or {}).get("chunks")
+        vectors = (result or {}).get("vectors_upserted")
+        if document_id:
+            summary_lines.append(f"document_id={document_id}")
+        if source:
+            summary_lines.append(f"source={source}")
+        if chunks is not None:
+            summary_lines.append(f"chunks={chunks}")
+        if vectors is not None:
+            summary_lines.append(f"vectors_upserted={vectors}")
+    elif task_name == "tasks.vector_search_task":
+        match_count = len(result.get("matches", [])) if result else 0
+        if payload.get("query"):
+            summary_lines.append(f"query={payload['query']}")
+        summary_lines.append(f"matches={match_count}")
+    elif task_name == "tasks.long_llm_task" and result:
+        if result.get("query"):
+            summary_lines.append(f"query={result['query']}")
+        if result.get("retrieval_count") is not None:
+            summary_lines.append(f"retrieval_count={result['retrieval_count']}")
+        if result.get("answer"):
+            answer = str(result["answer"]).strip()
+            summary_lines.append(f"answer={answer[:120]}{'...' if len(answer) > 120 else ''}")
+
+    if summary_lines:
+        parts.append("")
+        parts.append("Summary")
+        parts.extend(f"- {line}" for line in summary_lines)
+
+    if result and not summary_lines:
+        compact = json.dumps(result, ensure_ascii=True)
+        parts.append("")
+        parts.append("Result")
+        parts.append(compact[:1000] + ("..." if len(compact) > 1000 else ""))
+
     error = job.get("error")
     if error:
-        parts.append(f"error={error}")
+        parts.append("")
+        parts.append("Error")
+        parts.append(str(error))
+
     text = "\n".join(parts)
     if len(text) > MAX_TELEGRAM_MESSAGE_LEN:
         return f"{text[:MAX_TELEGRAM_MESSAGE_LEN]}...\n(truncated)"
@@ -286,13 +389,13 @@ async def group_add_handler(event: events.NewMessage.Event) -> None:
             return
 
     payload = {"group_id": group_id, "owner_id": event.sender_id, "group_label": group_label}
-    try:
-        data = await post_json("/groups/bind", payload)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 409:
-            await event.reply("This group is already bound to another account.")
-            return
-        raise
+    data = await _safe_api_call(
+        event,
+        post_json("/groups/bind", payload),
+        status_messages={409: "This group is already bound to another account."},
+    )
+    if not data:
+        return
     binding = data.get("binding") or {}
     await event.reply(
         f"Group bound: group_id={binding.get('group_id', group_id)} owner_id={binding.get('owner_id', event.sender_id)}"
@@ -305,17 +408,31 @@ async def group_remove_handler(event: events.NewMessage.Event) -> None:
         await event.reply("Cannot identify your user id.")
         return
     group_id_raw = (event.pattern_match.group(1) or "").strip()
-    if not group_id_raw:
-        await event.reply("Usage: /group_remove <group_id>")
-        return
+    if event.is_group or event.is_channel:
+        if group_id_raw:
+            try:
+                group_id = _parse_group_id(group_id_raw)
+            except ValueError as exc:
+                await event.reply(str(exc))
+                return
+        else:
+            group_id = event.chat_id
+            if group_id is None:
+                await event.reply("Cannot detect this group id.")
+                return
+    else:
+        if not group_id_raw:
+            await event.reply("Usage: /group_remove <group_id>")
+            return
+        try:
+            group_id = _parse_group_id(group_id_raw)
+        except ValueError as exc:
+            await event.reply(str(exc))
+            return
 
-    try:
-        group_id = _parse_group_id(group_id_raw)
-    except ValueError as exc:
-        await event.reply(str(exc))
+    data = await _safe_api_call(event, post_json("/groups/unbind", {"group_id": group_id, "owner_id": event.sender_id}))
+    if not data:
         return
-
-    data = await post_json("/groups/unbind", {"group_id": group_id, "owner_id": event.sender_id})
     if data.get("deleted"):
         await event.reply(f"Group removed: {group_id}")
         return
@@ -327,7 +444,9 @@ async def groups_handler(event: events.NewMessage.Event) -> None:
     if not event.sender_id:
         await event.reply("Cannot identify your user id.")
         return
-    data = await post_json("/groups/list", {"owner_id": event.sender_id, "limit": 100})
+    data = await _safe_api_call(event, post_json("/groups/list", {"owner_id": event.sender_id, "limit": 100}))
+    if not data:
+        return
     groups = data.get("groups", [])
     if not groups:
         await event.reply("No bound groups yet. Use /group_add <group_id> [group_label].")
@@ -361,13 +480,15 @@ async def ask_command_handler(event: events.NewMessage.Event) -> None:
             await event.reply("Cannot identify your user id.")
             return
 
-        try:
-            resolved = await get_json("/groups/resolve", params={"group_id": group_id})
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                await event.reply("This group is not bound to any account. Add it in private chat with /group_add <group_id>.")
-                return
-            raise
+        resolved = await _safe_api_call(
+            event,
+            get_json("/groups/resolve", params={"group_id": group_id}),
+            status_messages={
+                404: "This group is not bound to any account. Add it in private chat with /group_add <group_id>."
+            },
+        )
+        if not resolved:
+            return
 
         binding = resolved.get("binding") or {}
         owner_id = binding.get("owner_id")
@@ -383,14 +504,18 @@ async def ask_command_handler(event: events.NewMessage.Event) -> None:
             return
         _consume_group_limit(group_id)
 
-        data = await post_json("/ask", {"query": query, "owner_id": owner_id})
+        data = await _safe_api_call(event, post_json("/ask", {"query": query, "owner_id": owner_id}))
+        if not data:
+            return
         await event.reply(data["answer"])
         return
 
     if not event.sender_id:
         await event.reply("Cannot identify your user id.")
         return
-    data = await post_json("/ask", {"query": query, "owner_id": event.sender_id})
+    data = await _safe_api_call(event, post_json("/ask", {"query": query, "owner_id": event.sender_id}))
+    if not data:
+        return
     await event.reply(data["answer"])
 
 
@@ -401,10 +526,15 @@ async def jobs_list_callback(event: events.CallbackQuery.Event) -> None:
         return
     status = event.pattern_match.group(1).decode("utf-8")
     selected_status = None if status == "all" else status
-    data = await post_json(
-        "/tasks/list",
-        {"owner_id": event.sender_id, "status": selected_status, "limit": 10},
+    data = await _safe_api_call(
+        event,
+        post_json(
+            "/tasks/list",
+            {"owner_id": event.sender_id, "status": selected_status, "limit": 10},
+        ),
     )
+    if not data:
+        return
     jobs = data.get("jobs", [])
     if not jobs:
         await event.edit(
@@ -431,13 +561,13 @@ async def job_result_callback(event: events.CallbackQuery.Event) -> None:
         return
 
     job_id = event.pattern_match.group(1).decode("utf-8")
-    try:
-        job = await get_json(f"/tasks/{job_id}", params={"owner_id": event.sender_id})
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            await event.answer("Job not found", alert=True)
-            return
-        raise
+    job = await _safe_api_call(
+        event,
+        get_json(f"/tasks/{job_id}", params={"owner_id": event.sender_id}),
+        status_messages={404: "Job not found"},
+    )
+    if not job:
+        return
 
     await event.edit(_job_result_text(job), buttons=[[Button.inline("Back to statuses", b"jobs:all")]])
 
@@ -455,7 +585,9 @@ async def ask_handler(event: events.NewMessage.Event) -> None:
         await event.reply("Cannot identify your user id.")
         return
 
-    data = await post_json("/ask", {"query": text, "owner_id": event.sender_id})
+    data = await _safe_api_call(event, post_json("/ask", {"query": text, "owner_id": event.sender_id}))
+    if not data:
+        return
     await event.reply(data["answer"])
 
 

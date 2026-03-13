@@ -17,6 +17,14 @@ langchain = "0.3.27"
 langchain-openai = "0.3.35"
 pypdf = "5.6.1"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.2"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: docker compose integration tests",
+]
+
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
