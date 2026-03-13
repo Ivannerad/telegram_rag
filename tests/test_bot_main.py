@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable
 
 import httpx
 
 from app.business import NO_INFO_RESPONSE
+
+if not (os.getenv("TELEGRAM_API_ID") or "").strip():
+    os.environ["TELEGRAM_API_ID"] = "1"
+if not (os.getenv("TELEGRAM_API_HASH") or "").strip():
+    os.environ["TELEGRAM_API_HASH"] = "test-hash"
+
 from bot import main as bot_main
 
 
