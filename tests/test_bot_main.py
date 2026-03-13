@@ -6,12 +6,14 @@ from collections.abc import Awaitable
 
 import httpx
 
+from app.config import get_settings
 from app.business import NO_INFO_RESPONSE
 
 if not (os.getenv("TELEGRAM_API_ID") or "").strip():
     os.environ["TELEGRAM_API_ID"] = "1"
 if not (os.getenv("TELEGRAM_API_HASH") or "").strip():
     os.environ["TELEGRAM_API_HASH"] = "test-hash"
+get_settings.cache_clear()
 
 from bot import main as bot_main
 
